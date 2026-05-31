@@ -1,0 +1,1014 @@
+<!DOCTYPE html>
+<!--
+  index.html — Single-page frontend for the Seam Carving web tool.
+
+  Page flow:
+    1. User drags/drops or picks an image file.
+    2. File is uploaded to POST /upload → server saves it, returns session_id + dimensions.
+    3. User configures energy algorithm, direction, and resize target.
+    4. "Process Image" click fires POST /process AND POST /process_normal simultaneously.
+    5. Both result PNGs arrive (with dimension headers); displayed side-by-side.
+    6. User can download either result.
+
+  Technology: plain HTML + CSS + vanilla JS (no frameworks, no build step).
+  All logic lives in a single IIFE at the bottom of the file to avoid
+  polluting the global scope with state variables and helper functions.
+-->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Seam Carving</title>
+<style>
+  /* -----------------------------------------------------------------------
+     CSS reset + base
+     box-sizing: border-box globally so padding doesn't push elements outside
+     their declared width.  margin/padding reset avoids browser defaults.
+  ----------------------------------------------------------------------- */
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: #f5f5f5;
+    color: #222;
+    min-height: 100vh;
+  }
+
+  /* -----------------------------------------------------------------------
+     Header — dark banner with title and health badge
+  ----------------------------------------------------------------------- */
+  header {
+    background: #1a1a2e;
+    color: #fff;
+    padding: 1rem 2rem;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  header h1 { font-size: 1.4rem; letter-spacing: 0.05em; }
+
+  /* healthBadge: pill-shaped label in the top-right corner.
+     JS adds class "ok" (green) or "err" (red) after the /health fetch. */
+  #healthBadge {
+    font-size: 0.8rem;
+    padding: 0.25rem 0.6rem;
+    border-radius: 999px;
+    background: #444;   /* neutral grey while checking */
+    color: #aaa;
+  }
+  #healthBadge.ok  { background: #1a5c2a; color: #7dff99; }
+  #healthBadge.err { background: #5c1a1a; color: #ff9999; }
+
+  /* Constrain content width and center it */
+  main { max-width: 1100px; margin: 0 auto; padding: 2rem 1rem; }
+
+  /* -----------------------------------------------------------------------
+     Upload zone — dashed-border drag-and-drop target
+  ----------------------------------------------------------------------- */
+  #uploadZone {
+    border: 2px dashed #bbb;
+    border-radius: 10px;
+    padding: 2.5rem;
+    text-align: center;
+    cursor: pointer;
+    background: #fff;
+    transition: border-color 0.2s, background 0.2s;
+    user-select: none;   /* prevent text selection while dragging */
+  }
+  /* Visual feedback while a file is being dragged over the zone */
+  #uploadZone.dragover { border-color: #3a7bd5; background: #eef4ff; }
+  #uploadZone p { color: #777; font-size: 0.95rem; margin-top: 0.5rem; }
+  #uploadZone .icon { font-size: 2.5rem; }
+
+  /* The actual <input type="file"> is hidden; clicks on the zone trigger it */
+  #fileInput { display: none; }
+
+  /* -----------------------------------------------------------------------
+     Image row — shown after successful upload; holds original + result cols
+  ----------------------------------------------------------------------- */
+  #imageRow { display: none; margin-top: 1.5rem; }
+  .section-title {
+    font-size: 0.8rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: #888;
+    margin-bottom: 0.5rem;
+  }
+  /* White card wrapping each image thumbnail */
+  .img-wrapper {
+    background: #fff;
+    border-radius: 8px;
+    padding: 0.75rem;
+    display: inline-block;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+  }
+  .img-wrapper img { display: block; max-width: 100%; max-height: 400px; border-radius: 4px; }
+  .img-dims { font-size: 0.78rem; color: #888; margin-top: 0.35rem; }
+
+  /* -----------------------------------------------------------------------
+     Controls panel — energy, direction, resize mode, resize inputs
+  ----------------------------------------------------------------------- */
+  #controlsPanel {
+    display: none;           /* revealed after upload */
+    margin-top: 1.5rem;
+    background: #fff;
+    border-radius: 10px;
+    padding: 1.5rem;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+  }
+
+  /* Responsive grid: columns collapse to a single stack on narrow screens */
+  .controls-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 1.25rem 2rem;
+    align-items: start;
+  }
+
+  .ctrl-group label.group-label {
+    display: block;
+    font-size: 0.78rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    color: #555;
+    margin-bottom: 0.5rem;
+  }
+  select, input[type="number"] {
+    width: 100%;
+    padding: 0.45rem 0.65rem;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    font-size: 0.9rem;
+    background: #fafafa;
+  }
+
+  /* -----------------------------------------------------------------------
+     Radio buttons styled as toggle pills
+     The actual <input type="radio"> is hidden; the <label> acts as the button.
+     JS adds/removes class "selected" to highlight the active choice.
+  ----------------------------------------------------------------------- */
+  .radio-row { display: flex; gap: 0.75rem; flex-wrap: wrap; }
+  .radio-row label {
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+    font-size: 0.9rem;
+    cursor: pointer;
+    padding: 0.3rem 0.6rem;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    background: #fafafa;
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .radio-row input[type="radio"] { display: none; }
+  .radio-row label.selected { border-color: #3a7bd5; background: #eef4ff; color: #3a7bd5; font-weight: 600; }
+
+  /* -----------------------------------------------------------------------
+     Resize input groups — shown/hidden dynamically by updateResizeUI()
+  ----------------------------------------------------------------------- */
+  /* Single-direction sub-panels: all start hidden; JS sets display:"block" */
+  #resizeSingleScale, #resizeSingleWidth, #resizeSingleHeight { display: none; }
+  /* Both-direction panel also hidden by default */
+  #resizeBothGroup { display: none; }
+
+  /* Slider row: range input fills available space, value label is fixed width */
+  .slider-row { display: flex; align-items: center; gap: 0.75rem; }
+  input[type="range"] { flex: 1; accent-color: #3a7bd5; }
+  .slider-val {
+    min-width: 3.2rem;
+    text-align: right;
+    font-size: 0.9rem;
+    font-weight: 600;
+    color: #3a7bd5;
+  }
+  .sub-label { font-size: 0.8rem; color: #777; margin-bottom: 0.35rem; }
+
+  /* -----------------------------------------------------------------------
+     Process button
+  ----------------------------------------------------------------------- */
+  #processBtn {
+    display: block;
+    margin-top: 1.5rem;
+    width: 100%;
+    padding: 0.8rem;
+    background: #1a1a2e;
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    font-size: 1rem;
+    font-weight: 600;
+    cursor: pointer;
+    letter-spacing: 0.04em;
+    transition: background 0.2s;
+  }
+  #processBtn:hover:not(:disabled) { background: #3a7bd5; }
+  /* Disabled while no image is uploaded or while processing */
+  #processBtn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  /* -----------------------------------------------------------------------
+     Spinner — flex row with animated ring + text, shown during processing
+  ----------------------------------------------------------------------- */
+  #spinnerArea {
+    display: none;    /* flex while processing */
+    align-items: center;
+    gap: 1rem;
+    margin-top: 1.5rem;
+    color: #555;
+    font-size: 0.95rem;
+  }
+  .spinner {
+    width: 28px; height: 28px;
+    border: 3px solid #ddd;
+    border-top-color: #3a7bd5;    /* only the top segment is coloured → spin effect */
+    border-radius: 50%;
+    animation: spin 0.75s linear infinite;
+    flex-shrink: 0;               /* don't squash on narrow screens */
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* -----------------------------------------------------------------------
+     Error banner — shown on upload failure or processing error
+  ----------------------------------------------------------------------- */
+  #errorBanner {
+    display: none;
+    margin-top: 1rem;
+    background: #fff1f1;
+    border: 1px solid #f5c2c2;
+    color: #c0392b;
+    padding: 0.75rem 1rem;
+    border-radius: 8px;
+    font-size: 0.9rem;
+  }
+
+  /* -----------------------------------------------------------------------
+     Image comparison row — three columns side by side
+  ----------------------------------------------------------------------- */
+  .compare-row {
+    display: flex;
+    gap: 1.5rem;
+    flex-wrap: wrap;
+    margin-top: 0.75rem;
+  }
+  .compare-col { flex: 1; min-width: 220px; }
+  .compare-col .col-title {
+    font-size: 0.82rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    margin-bottom: 0.4rem;
+    color: #444;
+  }
+  /* Colour-coded column titles */
+  .compare-col.seam-col .col-title   { color: #1a5c2a; }
+  .compare-col.normal-col .col-title { color: #7b3a1a; }
+
+  /* Result columns hidden until processing completes */
+  .compare-col.seam-col,
+  .compare-col.normal-col { display: none; }
+
+  /* Download row — hidden until results are ready */
+  #downloadRow { display: none; margin-top: 1.25rem; }
+  .download-row { display: flex; gap: 1rem; flex-wrap: wrap; }
+  .dl-btn {
+    padding: 0.6rem 1.4rem;
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    font-size: 0.9rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.2s;
+  }
+  #downloadSeamBtn   { background: #1a5c2a; }
+  #downloadSeamBtn:hover   { background: #27ae60; }
+  #downloadNormalBtn { background: #7b3a1a; }
+  #downloadNormalBtn:hover { background: #c0622a; }
+</style>
+</head>
+<body>
+
+<!-- =========================================================================
+     Header — title + health badge
+========================================================================== -->
+<header>
+  <h1>Seam Carving</h1>
+  <!--
+    healthBadge: updated by a /health fetch on page load.
+    Shows "Binary: OK" (green) if the C++ binary is present and executable,
+    or "Binary: missing — run make" (red) otherwise.
+  -->
+  <span id="healthBadge">checking…</span>
+</header>
+
+<main>
+
+  <!-- =====================================================================
+       Upload zone
+       Clicking anywhere on this div triggers the hidden file picker.
+       Dragging a file over it adds the "dragover" class for visual feedback.
+  ====================================================================== -->
+  <div id="uploadZone">
+    <div class="icon">&#128247;</div>
+    <strong>Drag &amp; drop an image here</strong>
+    <p>or click to browse &mdash; JPG, PNG, BMP, TIFF, WebP &mdash; max 20 MB</p>
+    <!--
+      The actual file input is hidden and programmatically clicked.
+      accept="image/*" hints to the OS file picker to show only image files,
+      but the server also validates the extension independently.
+    -->
+    <input type="file" id="fileInput" accept="image/*">
+  </div>
+
+  <!-- =====================================================================
+       Image row — shown after upload; original always visible, result
+       columns appear after processing
+  ====================================================================== -->
+  <div id="imageRow">
+    <div class="section-title">Comparison</div>
+    <div class="compare-row">
+
+      <!-- Original -->
+      <div class="compare-col">
+        <div class="col-title">Original</div>
+        <div class="img-wrapper">
+          <img id="originalPreview" src="" alt="original">
+          <div class="img-dims" id="originalDims"></div>
+        </div>
+      </div>
+
+      <!-- Seam-carved result (hidden until ready) -->
+      <div class="compare-col seam-col" id="seamCol">
+        <div class="col-title">Seam Carving</div>
+        <div class="img-wrapper">
+          <img id="afterSeamImg" src="" alt="seam carved">
+          <div class="img-dims" id="afterSeamDims"></div>
+        </div>
+      </div>
+
+      <!-- Normal-resize result (hidden until ready) -->
+      <div class="compare-col normal-col" id="normalCol">
+        <div class="col-title">Normal Resize</div>
+        <div class="img-wrapper">
+          <img id="afterNormalImg" src="" alt="normal resize">
+          <div class="img-dims" id="afterNormalDims"></div>
+        </div>
+      </div>
+
+    </div><!-- .compare-row -->
+  </div><!-- #imageRow -->
+
+  <!-- =====================================================================
+       Controls panel
+       Shown after a successful upload.  Contains four control groups:
+         1. Energy algorithm <select>
+         2. Seam direction radio (Vertical / Horizontal / Both)
+         3. Resize mode radio (Scale % / Pixels)
+         4. Resize inputs (shown/hidden dynamically based on direction+mode)
+  ====================================================================== -->
+  <div id="controlsPanel">
+    <div class="controls-grid">
+
+      <!-- ---- Energy algorithm ------------------------------------------ -->
+      <div class="ctrl-group">
+        <label class="group-label" for="energyAlgo">Energy Algorithm</label>
+        <!--
+          Each option value is the single-letter code forwarded to the C++ binary.
+          Sobel is first because it's the default and most general-purpose.
+        -->
+        <select id="energyAlgo">
+          <option value="s">Sobel</option>
+          <option value="p">Prewitt</option>
+          <option value="l">Laplacian</option>
+          <option value="r">Roberts</option>
+          <option value="c">Canny</option>
+          <option value="f">Forward Energy</option>
+        </select>
+      </div>
+
+      <!-- ---- Seam direction --------------------------------------------- -->
+      <div class="ctrl-group">
+        <label class="group-label">Seam Direction</label>
+        <!--
+          Radio buttons styled as toggle pills (real <input> is hidden).
+          "Vertical" removes vertical seams → reduces image width.
+          "Horizontal" removes horizontal seams → reduces image height.
+          "Both" runs two passes: width first, then height.
+          JS adds/removes "selected" class on the wrapping <label>.
+        -->
+        <div class="radio-row" id="directionGroup">
+          <label id="lbl-dir-v" class="selected">
+            <input type="radio" name="direction" value="v" checked> Vertical
+          </label>
+          <label id="lbl-dir-h">
+            <input type="radio" name="direction" value="h"> Horizontal
+          </label>
+          <label id="lbl-dir-both">
+            <input type="radio" name="direction" value="both"> Both
+          </label>
+        </div>
+      </div>
+
+      <!-- ---- Resize mode ------------------------------------------------ -->
+      <div class="ctrl-group">
+        <label class="group-label">Resize Mode</label>
+        <!--
+          "Scale %" shows a slider (5–95 %) that maps to a 0.05–0.95 fraction.
+          "Pixels" shows a number input for the exact target dimension.
+          Changing this radio calls updateResizeUI() to show/hide sub-panels.
+        -->
+        <div class="radio-row" id="resizeModeGroup">
+          <label id="lbl-mode-scale" class="selected">
+            <input type="radio" name="resizeMode" value="scale" checked> Scale %
+          </label>
+          <label id="lbl-mode-px">
+            <input type="radio" name="resizeMode" value="px"> Pixels
+          </label>
+        </div>
+      </div>
+
+      <!-- ---- Resize inputs (single direction: v or h) ------------------- -->
+      <!--
+        The outer div (#resizeSingleControls) is shown when direction ≠ "both".
+        Inside, exactly one of the three sub-divs is visible at a time,
+        controlled by updateResizeUI() based on direction + mode selections.
+      -->
+      <div class="ctrl-group" id="resizeSingleControls">
+
+        <!-- Scale % slider (single direction) -->
+        <div id="resizeSingleScale">
+          <label class="group-label">Scale</label>
+          <!--
+            Range 5–95 (integer percent).  JS reads this as
+            parseFloat(value)/100 to get the 0.05–0.95 fraction.
+            The #scaleVal span is updated live on "input" events.
+          -->
+          <div class="slider-row">
+            <input type="range" id="scaleSlider" min="5" max="95" value="50">
+            <span class="slider-val" id="scaleVal">50%</span>
+          </div>
+        </div>
+
+        <!-- Target width (direction=v, mode=pixels) -->
+        <div id="resizeSingleWidth">
+          <label class="group-label" for="widthInput">Target Width (px)</label>
+          <input type="number" id="widthInput" min="1" placeholder="e.g. 400">
+        </div>
+
+        <!-- Target height (direction=h, mode=pixels) -->
+        <div id="resizeSingleHeight">
+          <label class="group-label" for="heightInput">Target Height (px)</label>
+          <input type="number" id="heightInput" min="1" placeholder="e.g. 300">
+        </div>
+
+      </div><!-- #resizeSingleControls -->
+
+      <!-- ---- Resize inputs (both directions) ---------------------------- -->
+      <!--
+        Shown only when direction="both".  Provides separate controls for
+        width and height because the two axes are resized independently.
+      -->
+      <div class="ctrl-group" id="resizeBothGroup" style="display:none">
+
+        <!-- Independent width + height sliders (both + scale) -->
+        <div id="resizeBothScale">
+          <div class="sub-label">Width scale</div>
+          <div class="slider-row">
+            <input type="range" id="scaleSliderV" min="5" max="95" value="70">
+            <span class="slider-val" id="scaleValV">70%</span>
+          </div>
+          <div class="sub-label" style="margin-top:0.75rem">Height scale</div>
+          <div class="slider-row">
+            <input type="range" id="scaleSliderH" min="5" max="95" value="70">
+            <span class="slider-val" id="scaleValH">70%</span>
+          </div>
+        </div>
+
+        <!-- Pixel inputs for both width and height (both + px) -->
+        <div id="resizeBothPx" style="display:none">
+          <label class="group-label" for="widthInputB">Target Width (px)</label>
+          <input type="number" id="widthInputB" min="1" placeholder="e.g. 400">
+          <label class="group-label" style="margin-top:0.75rem" for="heightInputB">Target Height (px)</label>
+          <input type="number" id="heightInputB" min="1" placeholder="e.g. 300">
+        </div>
+
+      </div><!-- #resizeBothGroup -->
+
+    </div><!-- .controls-grid -->
+
+    <!-- Disabled until upload succeeds; re-disabled during processing -->
+    <button id="processBtn" disabled>Process Image</button>
+  </div><!-- #controlsPanel -->
+
+  <!-- =====================================================================
+       Spinner — displayed (display:flex) while requests are in flight
+  ====================================================================== -->
+  <div id="spinnerArea">
+    <div class="spinner"></div>
+    <span>Processing&hellip; this may take a moment for large images.</span>
+  </div>
+
+  <!-- =====================================================================
+       Error banner — text is set by showError(); cleared by hideError()
+  ====================================================================== -->
+  <div id="errorBanner"></div>
+
+  <!-- =====================================================================
+       Download buttons — shown after both results are ready
+  ====================================================================== -->
+  <div id="downloadRow">
+    <div class="download-row">
+      <button id="downloadSeamBtn"   class="dl-btn">&#11015; Download Seam Carved</button>
+      <button id="downloadNormalBtn" class="dl-btn">&#11015; Download Normal Resize</button>
+    </div>
+  </div>
+
+</main>
+
+<!-- =========================================================================
+     JavaScript — wrapped in an IIFE to avoid polluting the global scope
+========================================================================== -->
+<script>
+(function () {
+  // -------------------------------------------------------------------------
+  // State
+  // These three variables represent the complete mutable state of the page.
+  // -------------------------------------------------------------------------
+
+  // session_id returned by /upload; sent with every /process call so the
+  // server can find the correct uploaded file.  null = no image uploaded yet.
+  let sessionId = null;
+
+  // Dimensions of the currently uploaded image (used for client-side
+  // validation: target size must be smaller than origW/origH).
+  let origW = 0, origH = 0;
+
+  // Blob object URLs for the most recent processed results.  Stored so we
+  // can revoke them (freeing memory) before creating new ones after each run,
+  // and so the download buttons can reference them later.
+  let seamObjectURL = null, normalObjectURL = null;
+
+  // -------------------------------------------------------------------------
+  // Element references
+  // All DOM lookups happen once at startup, not inside event handlers,
+  // to avoid repeated querySelector calls.
+  // -------------------------------------------------------------------------
+
+  const uploadZone      = document.getElementById("uploadZone");
+  const fileInput       = document.getElementById("fileInput");
+  const imageRow        = document.getElementById("imageRow");
+  const originalPrev    = document.getElementById("originalPreview");
+  const originalDims    = document.getElementById("originalDims");
+  const seamCol         = document.getElementById("seamCol");
+  const normalCol       = document.getElementById("normalCol");
+  const controlsPanel   = document.getElementById("controlsPanel");
+  const processBtn      = document.getElementById("processBtn");
+  const spinnerArea     = document.getElementById("spinnerArea");
+  const errorBanner     = document.getElementById("errorBanner");
+  const downloadRow     = document.getElementById("downloadRow");
+  const afterSeamImg    = document.getElementById("afterSeamImg");
+  const afterSeamDims   = document.getElementById("afterSeamDims");
+  const afterNormalImg  = document.getElementById("afterNormalImg");
+  const afterNormalDims = document.getElementById("afterNormalDims");
+  const downloadSeamBtn   = document.getElementById("downloadSeamBtn");
+  const downloadNormalBtn = document.getElementById("downloadNormalBtn");
+  const healthBadge     = document.getElementById("healthBadge");
+
+  // Resize UI sub-panels
+  const resizeSingleScale  = document.getElementById("resizeSingleScale");
+  const resizeSingleWidth  = document.getElementById("resizeSingleWidth");
+  const resizeSingleHeight = document.getElementById("resizeSingleHeight");
+  const resizeBothGroup    = document.getElementById("resizeBothGroup");
+  const resizeBothScale    = document.getElementById("resizeBothScale");
+  const resizeBothPx       = document.getElementById("resizeBothPx");
+
+  // Slider inputs and their live-value labels
+  const scaleSlider  = document.getElementById("scaleSlider");   // single-direction %
+  const scaleVal     = document.getElementById("scaleVal");
+  const scaleSliderV = document.getElementById("scaleSliderV");  // both — width %
+  const scaleValV    = document.getElementById("scaleValV");
+  const scaleSliderH = document.getElementById("scaleSliderH");  // both — height %
+  const scaleValH    = document.getElementById("scaleValH");
+
+  // Pixel-target number inputs
+  const widthInput  = document.getElementById("widthInput");    // single v
+  const heightInput = document.getElementById("heightInput");   // single h
+  const widthInputB  = document.getElementById("widthInputB");  // both
+  const heightInputB = document.getElementById("heightInputB"); // both
+
+  // -------------------------------------------------------------------------
+  // Health check — fires once on page load
+  // -------------------------------------------------------------------------
+
+  fetch("/health")
+    .then(r => r.json())
+    .then(d => {
+      // Update badge text and colour based on whether the binary is ready
+      healthBadge.textContent = d.binary_ok ? "Binary: OK" : "Binary: missing — run make";
+      healthBadge.className   = d.binary_ok ? "ok" : "err";
+    })
+    .catch(() => {
+      healthBadge.textContent = "Server unreachable";
+      healthBadge.className   = "err";
+    });
+
+  // -------------------------------------------------------------------------
+  // Upload zone event handlers
+  // -------------------------------------------------------------------------
+
+  // Clicking anywhere on the zone opens the OS file picker
+  uploadZone.addEventListener("click", () => fileInput.click());
+
+  // dragover: prevent default to allow drop; add highlight class
+  uploadZone.addEventListener("dragover",  e => {
+    e.preventDefault();
+    uploadZone.classList.add("dragover");
+  });
+
+  // dragleave: remove highlight when file leaves the zone
+  uploadZone.addEventListener("dragleave", () => uploadZone.classList.remove("dragover"));
+
+  // drop: extract the first dropped file and process it
+  uploadZone.addEventListener("drop", e => {
+    e.preventDefault();
+    uploadZone.classList.remove("dragover");
+    const file = e.dataTransfer.files[0];
+    if (file) handleFile(file);
+  });
+
+  // File picker change: triggered when user selects via the dialog
+  fileInput.addEventListener("change", () => {
+    if (fileInput.files[0]) handleFile(fileInput.files[0]);
+  });
+
+  /**
+   * handleFile(file)
+   *
+   * Called whenever the user selects or drops a file.  Does two things in
+   * parallel:
+   *   a) Uses FileReader to create a local data: URL for an immediate preview
+   *      (no network round-trip needed for the thumbnail).
+   *   b) POSTs the file as multipart/form-data to /upload, which saves it to
+   *      the server and returns { session_id, width, height }.
+   *
+   * On success: reveals the original preview, controls panel, and enables
+   * the Process button.  Also stores sessionId/origW/origH in state.
+   */
+  function handleFile(file) {
+    hideError();
+    // Hide result columns and download row when a new image is loaded
+    seamCol.style.display   = "none";
+    normalCol.style.display = "none";
+    downloadRow.style.display = "none";
+
+    // --- Local preview (instant, no server needed) ---
+    const reader = new FileReader();
+    reader.onload = e => {
+      originalPrev.src = e.target.result;
+    };
+    reader.readAsDataURL(file);
+
+    // --- Server upload ---
+    const fd = new FormData();
+    fd.append("image", file);
+    fetch("/upload", { method: "POST", body: fd })
+      .then(r => r.json())
+      .then(d => {
+        if (d.error) { showError(d.error); return; }
+
+        // Store session state
+        sessionId = d.session_id;
+        origW = d.width;
+        origH = d.height;
+
+        // Update dimension label
+        originalDims.textContent = `${origW} × ${origH} px`;
+
+        // Reveal image row and controls
+        imageRow.style.display      = "block";
+        controlsPanel.style.display = "block";
+        processBtn.disabled = false;
+
+        updateResizeUI();
+      })
+      .catch(err => showError("Upload failed: " + err.message));
+  }
+
+  // -------------------------------------------------------------------------
+  // Radio button styling
+  // -------------------------------------------------------------------------
+
+  /**
+   * styleRadios(groupId)
+   *
+   * Attaches "change" listeners to all radio inputs inside a group element.
+   * When a radio changes, removes "selected" from all sibling labels and adds
+   * it to the label wrapping the newly checked radio.
+   *
+   * This gives the toggle-pill appearance without CSS :checked selectors,
+   * which would require the real <input> to be visible.
+   */
+  function styleRadios(groupId) {
+    const group = document.getElementById(groupId);
+    group.querySelectorAll("input[type=radio]").forEach(r => {
+      r.addEventListener("change", () => {
+        // Deselect all labels in the group
+        group.querySelectorAll("label").forEach(l => l.classList.remove("selected"));
+        // Select the parent label of the changed radio
+        r.closest("label").classList.add("selected");
+      });
+    });
+  }
+  styleRadios("directionGroup");
+  styleRadios("resizeModeGroup");
+
+  // -------------------------------------------------------------------------
+  // Resize UI toggling
+  // -------------------------------------------------------------------------
+
+  /**
+   * currentDirection() / currentMode()
+   *
+   * Read helpers that return the currently selected radio value.
+   * Optional chaining (?.) guards against the unlikely case where no radio
+   * is checked (falls back to the hard-coded defaults "v" and "scale").
+   */
+  function currentDirection() {
+    return document.querySelector('input[name="direction"]:checked')?.value || "v";
+  }
+  function currentMode() {
+    return document.querySelector('input[name="resizeMode"]:checked')?.value || "scale";
+  }
+
+  /**
+   * updateResizeUI()
+   *
+   * Shows or hides resize input sub-panels based on the current
+   * direction+mode combination.  Called:
+   *   - After upload (to initialise with defaults)
+   *   - On every direction radio change
+   *   - On every resize-mode radio change
+   *
+   * Decision matrix:
+   *   direction=both, mode=scale  → show resizeBothGroup + resizeBothScale
+   *   direction=both, mode=px    → show resizeBothGroup + resizeBothPx
+   *   direction=v,   mode=scale  → show resizeSingleControls + resizeSingleScale
+   *   direction=v,   mode=px     → show resizeSingleControls + resizeSingleWidth
+   *   direction=h,   mode=scale  → show resizeSingleControls + resizeSingleScale
+   *   direction=h,   mode=px     → show resizeSingleControls + resizeSingleHeight
+   */
+  function updateResizeUI() {
+    const dir    = currentDirection();
+    const mode   = currentMode();
+    const isBoth  = dir === "both";
+    const isScale = mode === "scale";
+
+    // Top-level: swap between single-direction container and both-direction container
+    document.getElementById("resizeSingleControls").style.display = isBoth ? "none" : "block";
+    resizeBothGroup.style.display = isBoth ? "block" : "none";
+
+    if (!isBoth) {
+      // Show the correct single-direction sub-panel
+      // Must use "block" (not "") — "" would fall back to the CSS "display:none" rule
+      resizeSingleScale.style.display  = isScale                   ? "block" : "none";
+      resizeSingleWidth.style.display  = (!isScale && dir === "v") ? "block" : "none";
+      resizeSingleHeight.style.display = (!isScale && dir === "h") ? "block" : "none";
+    } else {
+      // Show the correct both-direction sub-panel
+      resizeBothScale.style.display = isScale ? "block" : "none";
+      resizeBothPx.style.display    = isScale ? "none"  : "block";
+    }
+  }
+
+  // Wire direction and mode radios to updateResizeUI
+  document.querySelectorAll('input[name="direction"]').forEach(r =>
+    r.addEventListener("change", updateResizeUI));
+  document.querySelectorAll('input[name="resizeMode"]').forEach(r =>
+    r.addEventListener("change", updateResizeUI));
+
+  // Live-update the percentage label next to each slider as the user drags
+  scaleSlider.addEventListener("input",  () => scaleVal.textContent  = scaleSlider.value  + "%");
+  scaleSliderV.addEventListener("input", () => scaleValV.textContent = scaleSliderV.value + "%");
+  scaleSliderH.addEventListener("input", () => scaleValH.textContent = scaleSliderH.value + "%");
+
+  // -------------------------------------------------------------------------
+  // Build request body
+  // -------------------------------------------------------------------------
+
+  /**
+   * buildBody()
+   *
+   * Reads the current state of all controls and returns a plain object that
+   * can be JSON-serialised and sent to /process and /process_normal.
+   *
+   * Returns { error: "<message>" } (not a proper Error) if client-side
+   * validation fails — the caller checks for this key before fetching.
+   *
+   * Body fields:
+   *   session_id  — UUID from the last successful /upload
+   *   energy      — single-letter code from the <select>
+   *   direction   — "v", "h", or "both"
+   *
+   *   For direction "v" or "h" + scale mode:
+   *     scale     — float, e.g. 0.50
+   *   For direction "v" + px mode:
+   *     width     — positive integer
+   *   For direction "h" + px mode:
+   *     height    — positive integer
+   *   For direction "both" + scale mode:
+   *     scale_v   — float
+   *     scale_h   — float
+   *   For direction "both" + px mode:
+   *     width + height
+   */
+  function buildBody() {
+    const dir  = currentDirection();
+    const mode = currentMode();
+    const body = {
+      session_id: sessionId,
+      energy:     document.getElementById("energyAlgo").value,
+      direction:  dir,
+    };
+
+    if (dir === "both") {
+      if (mode === "scale") {
+        // Convert integer percent (5–95) to decimal fraction (0.05–0.95)
+        body.scale_v = parseFloat(scaleSliderV.value) / 100;
+        body.scale_h = parseFloat(scaleSliderH.value) / 100;
+      } else {
+        const bw = parseInt(widthInputB.value,  10);
+        const bh = parseInt(heightInputB.value, 10);
+        // Validate: must be positive and strictly smaller than the original
+        if (!bw || !bh || bw >= origW || bh >= origH)
+          return { error: "Enter valid target width and height (smaller than original)." };
+        body.width  = bw;
+        body.height = bh;
+      }
+    } else if (mode === "scale") {
+      body.scale = parseFloat(scaleSlider.value) / 100;
+    } else if (dir === "v") {
+      const w = parseInt(widthInput.value, 10);
+      if (!w || w >= origW) return { error: "Enter a valid target width (smaller than original width)." };
+      body.width = w;
+    } else {
+      // direction="h", mode=pixels
+      const h = parseInt(heightInput.value, 10);
+      if (!h || h >= origH) return { error: "Enter a valid target height (smaller than original height)." };
+      body.height = h;
+    }
+    return body;
+  }
+
+  // -------------------------------------------------------------------------
+  // Process button handler
+  // -------------------------------------------------------------------------
+
+  /**
+   * Click handler (async) — fires when the user clicks "Process Image".
+   *
+   * Uses Promise.all() to send /process and /process_normal simultaneously.
+   * Both requests share the same JSON body; the server routes handle them
+   * independently with separate output files.
+   *
+   * Parallel execution is critical for good UX: seam carving can take 10–60 s
+   * on large images, and we don't want to wait for it before starting the
+   * (much faster) normal resize.  Flask must be running in threaded mode for
+   * this to work (see Makefile --with-threads flag).
+   *
+   * After both responses arrive:
+   *   - Extract X-Result-Width / X-Result-Height headers for dimension labels.
+   *   - Call .blob() to get the raw PNG bytes.
+   *   - Create blob: object URLs and set them as <img> src values.
+   *   - Revoke any previous blob URLs to free browser memory.
+   */
+  processBtn.addEventListener("click", async () => {
+    hideError();
+    if (!sessionId) { showError("Please upload an image first."); return; }
+
+    const body = buildBody();
+    if (body.error) { showError(body.error); return; }  // client-side validation failed
+
+    // Show spinner, disable button, hide result columns
+    spinnerArea.style.display = "flex";
+    processBtn.disabled = true;
+    seamCol.style.display   = "none";
+    normalCol.style.display = "none";
+    downloadRow.style.display = "none";
+
+    // Fire both requests in parallel
+    const [seamResp, normalResp] = await Promise.all([
+      fetch("/process",        {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      }),
+      fetch("/process_normal", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      }),
+    ]).catch(err => {
+      // Network error (server down, CORS, etc.) — both responses are null
+      spinnerArea.style.display = "none";
+      processBtn.disabled = false;
+      showError("Request failed: " + err.message);
+      return [null, null];
+    });
+
+    // Re-enable UI regardless of whether requests succeeded
+    spinnerArea.style.display = "none";
+    processBtn.disabled = false;
+
+    if (!seamResp || !normalResp) return;  // already showed error above
+
+    // Check HTTP status for seam response
+    if (!seamResp.ok) {
+      // Parse error JSON from the server, with a fallback for non-JSON bodies
+      const j = await seamResp.json().catch(() => ({ error: "Server error" }));
+      showError("Seam carving failed: " + (j.error || "") + (j.detail ? " — " + j.detail : ""));
+      return;
+    }
+
+    // Check HTTP status for normal response
+    if (!normalResp.ok) {
+      const j = await normalResp.json().catch(() => ({ error: "Server error" }));
+      showError("Normal resize failed: " + (j.error || "") + (j.detail ? " — " + j.detail : ""));
+      return;
+    }
+
+    // Read output dimensions from custom response headers
+    const seamW = seamResp.headers.get("X-Result-Width")    || "?";
+    const seamH = seamResp.headers.get("X-Result-Height")   || "?";
+    const normW = normalResp.headers.get("X-Result-Width")  || "?";
+    const normH = normalResp.headers.get("X-Result-Height") || "?";
+
+    // Decode response bodies as Blob (binary PNG data)
+    const seamBlob   = await seamResp.blob();
+    const normalBlob = await normalResp.blob();
+
+    // Revoke previous blob URLs to free memory (no-op if null)
+    if (seamObjectURL)   URL.revokeObjectURL(seamObjectURL);
+    if (normalObjectURL) URL.revokeObjectURL(normalObjectURL);
+
+    // Create new blob: URLs — these act like temporary file URLs in the browser
+    seamObjectURL   = URL.createObjectURL(seamBlob);
+    normalObjectURL = URL.createObjectURL(normalBlob);
+
+    // Update images and dimension labels
+    afterSeamImg.src    = seamObjectURL;
+    afterNormalImg.src  = normalObjectURL;
+    afterSeamDims.textContent   = `${seamW} × ${seamH} px`;
+    afterNormalDims.textContent = `${normW} × ${normH} px`;
+
+    // Reveal result columns and download buttons
+    seamCol.style.display     = "flex";
+    normalCol.style.display   = "flex";
+    downloadRow.style.display = "block";
+  });
+
+  // -------------------------------------------------------------------------
+  // Download button handlers
+  // -------------------------------------------------------------------------
+
+  /**
+   * Programmatically click a temporary <a> element pointing to the blob URL.
+   */
+  downloadSeamBtn.addEventListener("click", () => {
+    if (!seamObjectURL) return;
+    const a = document.createElement("a");
+    a.href = seamObjectURL;
+    a.download = "seam_carved_result.png";
+    a.click();
+  });
+
+  downloadNormalBtn.addEventListener("click", () => {
+    if (!normalObjectURL) return;
+    const a = document.createElement("a");
+    a.href = normalObjectURL;
+    a.download = "normal_resized_result.png";
+    a.click();
+  });
+
+  // -------------------------------------------------------------------------
+  // Error helpers
+  // -------------------------------------------------------------------------
+
+  /** Display an error message in the red banner below the controls. */
+  function showError(msg) {
+    errorBanner.textContent = msg;
+    errorBanner.style.display = "block";
+  }
+
+  /** Hide the error banner (called before every new action). */
+  function hideError() {
+    errorBanner.style.display = "none";
+  }
+
+  // Initialise resize inputs to match the default radio selection on load
+  updateResizeUI();
+
+})();  // end IIFE
+</script>
+</body>
+</html>
